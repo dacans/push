@@ -4,7 +4,7 @@ const admin = require("firebase-admin");
 const fetch = require("node-fetch");
 
 admin.initializeApp({
-  credential: admin.credential.cert(require("./serviceAccountKey.json")),
+  credential: admin.credential.cert(JSON.parse(process.env.SERVICE_ACCOUNT_KEY)),
 });
 
 const db = admin.firestore();
