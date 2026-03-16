@@ -22,7 +22,8 @@ app.use(express.urlencoded({ extended: true }));
 ========================= */
 
 const COUNTRIES = ["MX", "ES", "CO"];
-const LEAD_MAX_DAYS = 15; // leads older than this get purged
+const LEAD_MAX_DAYS = 15;
+const countryFlag = { MX: "🇲🇽", ES: "🇪🇸", CO: "🇨🇴", "?": "❓" };
 
 const NO_LEAD_PRESETS = {
   finish:    { title: "⚠️ Completa tu solicitud", body: "Iniciaste una solicitud pero no la terminaste. Complétala ahora." },
@@ -52,17 +53,9 @@ function calcDayFromCreatedAt(createdAt) {
   return Math.min(7, Math.max(1, day));
 }
 
-function ageInDays(createdAt) {
-  if (!createdAt) return null;
-  const start = createdAt.toDate ? createdAt.toDate() : new Date(createdAt);
-  return Math.floor((Date.now() - start.getTime()) / 86400000);
-}
-
-/* Send push to array of tokens, returns { sent, invalidTokens } */
 async function sendPush(tokens, payload, screen) {
   let sent = 0;
   const invalidTokens = [];
-
   for (let i = 0; i < tokens.length; i += 100) {
     const chunk = tokens.slice(i, i + 100);
     const resp = await fetch("https://exp.host/--/api/v2/push/send", {
@@ -73,16 +66,12 @@ async function sendPush(tokens, payload, screen) {
         title: payload.title, body: payload.body, data: { screen },
       }))),
     });
-
     const json = await resp.json();
     if (!resp.ok) throw new Error(JSON.stringify(json));
-
     json.data.forEach((result, idx) => {
-      if (result.status === "error") {
-        const e = result.details?.error;
-        if (e === "DeviceNotRegistered" || e === "InvalidCredentials") {
-          invalidTokens.push(chunk[idx]);
-        }
+      const e = result.details?.error;
+      if (e === "DeviceNotRegistered" || e === "InvalidCredentials") {
+        invalidTokens.push(chunk[idx]);
       } else if (result.status === "ok") {
         sent++;
       }
@@ -91,106 +80,33 @@ async function sendPush(tokens, payload, screen) {
   return { sent, invalidTokens };
 }
 
-/* Remove invalid tokens using targeted queries instead of full scan */
 async function cleanInvalidTokens(invalidTokens) {
   if (!invalidTokens.length) return 0;
   const batch = db.batch();
   let cleaned = 0;
-
   for (const token of invalidTokens) {
-    // Query devices by token field — no full scan
-    const devSnap = await db.collection("devices")
-      .where("expo_push_token", "==", token).get();
+    const devSnap = await db.collection("devices").where("expo_push_token", "==", token).get();
     devSnap.docs.forEach((d) => { batch.delete(d.ref); cleaned++; });
-
-    // Query leads by pushToken field
-    const leadSnap = await db.collection("leads")
-      .where("pushToken", "==", token).get();
+    const leadSnap = await db.collection("leads").where("pushToken", "==", token).get();
     leadSnap.docs.forEach((d) => {
       batch.update(d.ref, { pushToken: admin.firestore.FieldValue.delete() });
       cleaned++;
     });
   }
-
   await batch.commit();
   return cleaned;
 }
 
-/* Load all devices and leads once, return structured stats */
-async function loadStats() {
-  const [devicesSnap, leadsSnap] = await Promise.all([
-    db.collection("devices").get(),
-    db.collection("leads").get(),
-  ]);
-
-  // Per-country stats
-  const byCountry = {};
-  COUNTRIES.forEach((c) => {
-    byCountry[c] = { devices: 0, noLead: 0, leads: 0, days: { 1:0,2:0,3:0,4:0,5:0,6:0,7:0 } };
-  });
-  byCountry["?"] = { devices: 0, noLead: 0, leads: 0, days: { 1:0,2:0,3:0,4:0,5:0,6:0,7:0 } };
-
-  devicesSnap.docs.forEach((d) => {
-    const data = d.data();
-    const c = COUNTRIES.includes(data.country) ? data.country : "?";
-    byCountry[c].devices++;
-    if (data.hasLead !== true) byCountry[c].noLead++;
-  });
-
-  leadsSnap.docs.forEach((d) => {
-    const data = d.data();
-    const c = COUNTRIES.includes(data.country) ? data.country : "?";
-    byCountry[c].leads++;
-    const day = calcDayFromCreatedAt(data.createdAt);
-    if (day) byCountry[c].days[day]++;
-  });
-
-  const totalDevices = devicesSnap.size;
-  const totalLeads   = leadsSnap.size;
-  const totalNoLead  = devicesSnap.docs.filter((d) => d.data().hasLead !== true).length;
-
-  return { byCountry, totalDevices, totalLeads, totalNoLead, devicesSnap, leadsSnap };
-}
-
-/* =========================
-   CONTROL CENTER (UI)
-========================= */
-
-app.get("/", async (req, res) => {
-  const { msg, error } = req.query;
-
-  const { byCountry, totalDevices, totalLeads, totalNoLead } = await loadStats();
-
-  const countryFlag = { MX: "🇲🇽", ES: "🇪🇸", CO: "🇨🇴", "?": "❓" };
-
-  const countryStatsHtml = [...COUNTRIES, "?"].map((c) => {
-    const s = byCountry[c];
-    if (!s.devices && !s.leads) return "";
-    return `
-    <div class="card">
-      <h2>${countryFlag[c]} ${c === "?" ? "Sin país" : c}</h2>
-      <p class="stat">📱 Devices: ${s.devices}</p>
-      <p class="stat">🚫 Sin solicitud: ${s.noLead}</p>
-      <p class="stat">📋 Leads: ${s.leads}</p>
-      <hr style="border:none;border-top:1px solid #eee;margin:10px 0"/>
-      ${Object.entries(s.days).map(([d,v]) => `<p class="stat" style="font-size:13px">Día ${d}: ${v}</p>`).join("")}
-    </div>`;
-  }).join("");
-
-  res.send(`
-<!DOCTYPE html>
-<html>
-<head>
-<title>Push Control Center</title>
-<style>
+const CSS = `
 body{font-family:Arial;background:#f5f7fb;padding:30px}
 .container{max-width:1400px;margin:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:30px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:24px}
 .card{background:#fff;padding:20px;border-radius:14px;box-shadow:0 8px 20px rgba(0,0,0,.08)}
 h1{margin-bottom:8px} h2{margin-top:0}
 button{width:100%;padding:14px;font-size:15px;font-weight:700;border-radius:10px;border:none;margin-top:8px;cursor:pointer}
 .primary{background:#1FA971;color:#fff} .warn{background:#F6A800;color:#fff}
-.danger{background:#dc3545;color:#fff} .purple{background:#6610f2;color:#fff;font-size:16px;padding:16px;margin-top:12px}
+.danger{background:#dc3545;color:#fff} .purple{background:#6610f2;color:#fff;padding:16px;margin-top:12px}
+.secondary{background:#eee;color:#333;width:auto;padding:12px 24px}
 input,textarea,select{width:100%;padding:12px;font-size:15px;border-radius:8px;border:1px solid #ccc;margin-top:6px}
 textarea{min-height:80px}
 .ok{background:#e7f9ed;color:#1e7e34;padding:12px;border-radius:8px;margin-bottom:20px}
@@ -198,82 +114,82 @@ textarea{min-height:80px}
 .stat{font-weight:600;margin:4px 0;font-size:14px}
 .divider{border:none;border-top:2px solid #eee;margin:14px 0}
 .section-title{font-size:18px;font-weight:800;margin:28px 0 12px;color:#333;border-left:4px solid #1FA971;padding-left:10px}
-.totals{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}
-.total-pill{background:#fff;border-radius:12px;padding:14px 22px;box-shadow:0 4px 12px rgba(0,0,0,.07);font-weight:700;font-size:15px}
+a.btn{display:inline-block;padding:12px 20px;background:#dc3545;color:#fff;text-decoration:none;border-radius:8px;font-weight:700;margin:4px}
+a.btn.green{background:#1FA971}
+.stat-row{display:grid;grid-template-columns:2fr 1fr;padding:10px;border-bottom:1px solid #eee}
+.stat-row:last-child{border:none} .slabel{font-weight:600} .svalue{text-align:right;color:#1FA971;font-weight:700}
+.warning{color:#F6A800} .danger-text{color:#dc3545}
+pre{background:#f8f9fa;padding:15px;border-radius:8px;overflow-x:auto;font-size:12px}
+.total-pill{background:#fff;border-radius:12px;padding:14px 22px;box-shadow:0 4px 12px rgba(0,0,0,.07);font-weight:700;font-size:15px;display:inline-block;margin-right:12px;margin-bottom:12px}
 .total-pill span{color:#1FA971;font-size:22px;display:block}
-</style>
-</head>
-<body>
+`;
+
+const countrySelect = `
+<label>País</label>
+<select name="country">
+  <option value="ALL">🌎 Todos</option>
+  <option value="MX">🇲🇽 México</option>
+  <option value="ES">🇪🇸 España</option>
+  <option value="CO">🇨🇴 Colombia</option>
+</select>`;
+
+/* =========================
+   HEALTH — Render health check, never reads Firestore
+========================= */
+
+app.get("/health", (req, res) => res.send("ok"));
+
+/* =========================
+   CONTROL CENTER — zero Firestore reads
+========================= */
+
+app.get("/", (req, res) => {
+  const { msg, error } = req.query;
+  res.send(`<!DOCTYPE html><html><head><title>Push Control Center</title>
+<style>${CSS}</style></head><body>
 <div class="container">
 <h1>📣 Push Control Center</h1>
-
 ${msg   ? `<div class="ok">${msg}</div>`   : ""}
 ${error ? `<div class="err">${error}</div>` : ""}
 
-<!-- TOTALS -->
-<div class="totals">
-  <div class="total-pill"><span>${totalDevices}</span>Total Devices</div>
-  <div class="total-pill"><span>${totalLeads}</span>Total Leads</div>
-  <div class="total-pill"><span>${totalNoLead}</span>Sin solicitud</div>
+<div class="section-title">📊 Stats</div>
+<div style="background:#fff;padding:24px;border-radius:14px;box-shadow:0 8px 20px rgba(0,0,0,.08);margin-bottom:24px;text-align:center">
+  <p style="color:#666;margin-bottom:16px">Las stats no se cargan solas para no gastar reads de Firestore.</p>
+  <a href="/stats"><button class="primary" style="width:auto;padding:14px 32px">📊 Cargar Stats</button></a>
 </div>
 
-<!-- STATS POR PAÍS -->
-<div class="section-title">📊 Stats por País</div>
-<div class="grid">${countryStatsHtml}</div>
-
-<!-- PUSH ACTIONS -->
 <div class="section-title">📤 Enviar Notificaciones</div>
 <div class="grid">
 
-  <!-- Sin solicitud -->
   <div class="card">
     <h2>Sin solicitud</h2>
     <form method="POST" action="/preview">
       <input type="hidden" name="type" value="no-lead"/>
-      <label>País</label>
-      <select name="country">
-        <option value="ALL">🌎 Todos</option>
-        <option value="MX">🇲🇽 México</option>
-        <option value="ES">🇪🇸 España</option>
-        <option value="CO">🇨🇴 Colombia</option>
-      </select>
+      ${countrySelect}
       <button name="preset" value="finish" class="warn">⚠️ Completar solicitud</button>
       <button name="preset" value="dont_miss" class="warn">⏳ No la dejes pasar</button>
       <button name="preset" value="almost" class="warn">🚀 Casi listo</button>
     </form>
   </div>
 
-  <!-- Por día -->
   <div class="card">
     <h2>Solicitudes día 1–7</h2>
     <form method="POST" action="/preview">
       <input type="hidden" name="type" value="day"/>
-      <label>País</label>
-      <select name="country">
-        <option value="ALL">🌎 Todos</option>
-        <option value="MX">🇲🇽 México</option>
-        <option value="ES">🇪🇸 España</option>
-        <option value="CO">🇨🇴 Colombia</option>
-      </select>
+      ${countrySelect}
       ${Object.keys(DAY_PRESETS).map((d) =>
         `<button name="day" value="${d}" class="primary">Día ${d}</button>`
       ).join("")}
     </form>
     <hr class="divider"/>
     <form method="POST" action="/preview-all-days">
-      <select name="country">
-        <option value="ALL">🌎 Todos</option>
-        <option value="MX">🇲🇽 México</option>
-        <option value="ES">🇪🇸 España</option>
-        <option value="CO">🇨🇴 Colombia</option>
-      </select>
-      <button class="purple" onclick="return confirm('¿Enviar a TODOS los leads (días 1–7)?')">
+      ${countrySelect}
+      <button class="purple" onclick="return confirm('¿Enviar a TODOS los leads días 1–7?')">
         🚀 Enviar Todos los Días (1–7)
       </button>
     </form>
   </div>
 
-  <!-- Manual -->
   <div class="card">
     <h2>Envío manual</h2>
     <form method="POST" action="/preview">
@@ -285,33 +201,26 @@ ${error ? `<div class="err">${error}</div>` : ""}
         <option value="no-lead">Sin solicitud</option>
         <option value="lead">Con solicitud</option>
       </select>
-      <label>País</label>
-      <select name="country">
-        <option value="ALL">🌎 Todos</option>
-        <option value="MX">🇲🇽 México</option>
-        <option value="ES">🇪🇸 España</option>
-        <option value="CO">🇨🇴 Colombia</option>
-      </select>
+      ${countrySelect}
       <button class="primary">Preview</button>
     </form>
   </div>
 
-  <!-- Mantenimiento -->
   <div class="card">
     <h2>🗑️ Mantenimiento DB</h2>
-    <p style="font-size:13px;color:#666;margin-bottom:8px">Limpia tokens inválidos (DeviceNotRegistered)</p>
+    <p style="font-size:13px;color:#666;margin-bottom:4px">Limpia tokens inválidos</p>
     <form method="GET" action="/clean-tokens">
       <button class="danger" onclick="return confirm('¿Limpiar tokens muertos?')">🧹 Limpiar tokens inválidos</button>
     </form>
     <hr class="divider"/>
-    <p style="font-size:13px;color:#666;margin-bottom:8px">Elimina leads sin pushToken</p>
-    <form method="GET" action="/purge-null-tokens" onsubmit="return confirm('¿Eliminar todos los leads sin pushToken?')">
+    <p style="font-size:13px;color:#666;margin-bottom:4px">Elimina leads sin pushToken</p>
+    <form method="GET" action="/purge-null-tokens" onsubmit="return confirm('¿Eliminar leads sin pushToken?')">
       <button class="danger">🗑️ Purgar leads sin token</button>
     </form>
     <hr class="divider"/>
-    <p style="font-size:13px;color:#666;margin-bottom:8px">Elimina leads y devices con +${LEAD_MAX_DAYS} días</p>
-    <form method="GET" action="/purge-old" onsubmit="return confirm('¿Eliminar registros con más de ${LEAD_MAX_DAYS} días?')">
-      <button class="danger">🗑️ Purgar registros viejos (+${LEAD_MAX_DAYS} días)</button>
+    <p style="font-size:13px;color:#666;margin-bottom:4px">Elimina registros con +${LEAD_MAX_DAYS} días</p>
+    <form method="GET" action="/purge-old" onsubmit="return confirm('¿Purgar registros viejos?')">
+      <button class="danger">🗑️ Purgar +${LEAD_MAX_DAYS} días</button>
     </form>
     <hr class="divider"/>
     <form method="GET" action="/diagnostico">
@@ -320,31 +229,99 @@ ${error ? `<div class="err">${error}</div>` : ""}
   </div>
 
 </div>
-</div>
-</body>
-</html>
-`);
+</div></body></html>`);
 });
 
 /* =========================
-   PREVIEW (with country filter)
+   STATS — only when you click the button
+========================= */
+
+app.get("/stats", async (req, res) => {
+  try {
+    const [devicesSnap, leadsSnap] = await Promise.all([
+      db.collection("devices").get(),
+      db.collection("leads").get(),
+    ]);
+
+    const byCountry = {};
+    COUNTRIES.forEach((c) => {
+      byCountry[c] = { devices: 0, noLead: 0, leads: 0, days: {1:0,2:0,3:0,4:0,5:0,6:0,7:0} };
+    });
+    byCountry["?"] = { devices: 0, noLead: 0, leads: 0, days: {1:0,2:0,3:0,4:0,5:0,6:0,7:0} };
+
+    devicesSnap.docs.forEach((d) => {
+      const data = d.data();
+      const c = COUNTRIES.includes(data.country) ? data.country : "?";
+      byCountry[c].devices++;
+      if (data.hasLead !== true) byCountry[c].noLead++;
+    });
+
+    leadsSnap.docs.forEach((d) => {
+      const data = d.data();
+      const c = COUNTRIES.includes(data.country) ? data.country : "?";
+      byCountry[c].leads++;
+      const day = calcDayFromCreatedAt(data.createdAt);
+      if (day) byCountry[c].days[day]++;
+    });
+
+    const totalDevices = devicesSnap.size;
+    const totalLeads   = leadsSnap.size;
+    const totalNoLead  = devicesSnap.docs.filter((d) => d.data().hasLead !== true).length;
+
+    const cardsHtml = [...COUNTRIES, "?"].map((c) => {
+      const s = byCountry[c];
+      if (!s.devices && !s.leads) return "";
+      return `<div class="card">
+        <h2>${countryFlag[c]} ${c === "?" ? "Sin país" : c}</h2>
+        <p class="stat">📱 Devices: ${s.devices}</p>
+        <p class="stat">🚫 Sin solicitud: ${s.noLead}</p>
+        <p class="stat">📋 Leads: ${s.leads}</p>
+        <hr style="border:none;border-top:1px solid #eee;margin:10px 0"/>
+        ${Object.entries(s.days).map(([d,v]) =>
+          `<p class="stat" style="font-size:13px">Día ${d}: ${v}</p>`
+        ).join("")}
+      </div>`;
+    }).join("");
+
+    res.send(`<!DOCTYPE html><html><head><title>Stats</title>
+<style>${CSS}</style></head><body>
+<div class="container">
+<h1>📊 Stats</h1>
+<a href="/">← Volver al panel</a>
+
+<div style="margin:20px 0">
+  <div class="total-pill"><span>${totalDevices}</span>Total Devices</div>
+  <div class="total-pill"><span>${totalLeads}</span>Total Leads</div>
+  <div class="total-pill"><span>${totalNoLead}</span>Sin solicitud</div>
+</div>
+
+<div class="section-title">Por País</div>
+<div class="grid">${cardsHtml}</div>
+
+<a href="/">← Volver</a>
+</div></body></html>`);
+  } catch (e) {
+    res.send(`<h1>Error</h1><pre>${e.message}</pre><a href="/">Volver</a>`);
+  }
+});
+
+/* =========================
+   PREVIEW
 ========================= */
 
 app.post("/preview", async (req, res) => {
   try {
     const { type, preset, day, manualTitle, manualBody, country } = req.body;
     const filterCountry = country && country !== "ALL" ? country : null;
-
     let payload, tokens = [], targetLabel;
 
     if (type === "no-lead") {
       payload = NO_LEAD_PRESETS[preset];
       if (!payload) return res.redirect("/?error=Preset inválido");
-
-      let query = db.collection("devices").where("hasLead", "!=", true);
-      const snap = await query.get();
+      const snap = await db.collection("devices").get();
       snap.docs.forEach((d) => {
         const data = d.data();
+        if (data.hasLead === true) return;
         if (filterCountry && data.country !== filterCountry) return;
         if (data.expo_push_token) tokens.push(data.expo_push_token);
       });
@@ -354,9 +331,8 @@ app.post("/preview", async (req, res) => {
       const dayNum = parseInt(day);
       if (!dayNum) return res.redirect("/?error=Día inválido");
       payload = { title: DAY_PRESETS[dayNum], body: `Actualización del día ${dayNum} de tu solicitud.` };
-
-      const leadsSnap = await db.collection("leads").get();
-      leadsSnap.docs.forEach((d) => {
+      const snap = await db.collection("leads").get();
+      snap.docs.forEach((d) => {
         const data = d.data();
         if (filterCountry && data.country !== filterCountry) return;
         if (calcDayFromCreatedAt(data.createdAt) === dayNum && data.pushToken) {
@@ -365,40 +341,32 @@ app.post("/preview", async (req, res) => {
       });
       targetLabel = `día ${dayNum}${filterCountry ? ` (${filterCountry})` : ""}`;
 
-    } else if (type === "lead" || type === "all") {
+    } else {
       payload = { title: manualTitle, body: manualBody };
       if (type === "all" || type === "lead") {
-        const leadsSnap = await db.collection("leads").get();
-        leadsSnap.docs.forEach((d) => {
+        const snap = await db.collection("leads").get();
+        snap.docs.forEach((d) => {
           const data = d.data();
           if (filterCountry && data.country !== filterCountry) return;
           if (data.pushToken) tokens.push(data.pushToken);
         });
       }
       if (type === "all" || type === "no-lead") {
-        const devSnap = await db.collection("devices").get();
-        devSnap.docs.forEach((d) => {
+        const snap = await db.collection("devices").get();
+        snap.docs.forEach((d) => {
           const data = d.data();
           if (filterCountry && data.country !== filterCountry) return;
           if (data.hasLead !== true && data.expo_push_token) tokens.push(data.expo_push_token);
         });
       }
       targetLabel = `manual${filterCountry ? ` (${filterCountry})` : ""}`;
-    } else {
-      payload = { title: manualTitle, body: manualBody };
-      targetLabel = "manual";
     }
 
-    // Deduplicate tokens
     tokens = [...new Set(tokens)];
 
-    res.send(`
-<!DOCTYPE html><html><head><title>Preview</title>
-<style>body{font-family:Arial;background:#f5f7fb;padding:30px}.container{max-width:700px;margin:auto}
-.card{background:#fff;padding:24px;border-radius:14px;box-shadow:0 8px 20px rgba(0,0,0,.08)}
-button{padding:14px 28px;font-size:16px;font-weight:700;border-radius:10px;border:none;cursor:pointer;margin-right:10px}
-.primary{background:#1FA971;color:#fff}.secondary{background:#eee;color:#333}</style></head>
-<body><div class="container">
+    res.send(`<!DOCTYPE html><html><head><title>Preview</title>
+<style>${CSS}</style></head><body>
+<div class="container">
 <h1>👀 Preview: ${targetLabel}</h1>
 <div class="card">
   <p><strong>Título:</strong> ${payload.title}</p>
@@ -412,8 +380,8 @@ button{padding:14px 28px;font-size:16px;font-weight:700;border-radius:10px;borde
     <button class="primary" onclick="return confirm('¿Enviar a ${tokens.length} usuarios?')">
       ✅ Confirmar envío
     </button>
-    <a href="/"><button type="button" class="secondary">Cancelar</button></a>
   </form>
+  <a href="/"><button type="button" class="secondary" style="margin-top:8px">Cancelar</button></a>
 </div></div></body></html>`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
@@ -429,10 +397,8 @@ app.post("/send", async (req, res) => {
     const { title, body, tokens: rawTokens, screen } = req.body;
     const tokens = rawTokens ? rawTokens.split(",").filter(Boolean) : [];
     if (!tokens.length) return res.redirect("/?error=Sin tokens");
-
-    const { sent, invalidTokens } = await sendPush({ title, body }, { title, body }, screen || "home");
+    const { sent, invalidTokens } = await sendPush(tokens, { title, body }, screen || "home");
     const cleaned = await cleanInvalidTokens(invalidTokens);
-
     res.redirect(`/?msg=✅ Enviado a ${sent} usuarios. ${cleaned} tokens inválidos limpiados.`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
@@ -440,15 +406,14 @@ app.post("/send", async (req, res) => {
 });
 
 /* =========================
-   PREVIEW ALL DAYS (with country)
+   PREVIEW ALL DAYS
 ========================= */
 
 app.post("/preview-all-days", async (req, res) => {
   try {
     const filterCountry = req.body.country && req.body.country !== "ALL" ? req.body.country : null;
     const leadsSnap = await db.collection("leads").get();
-
-    const dayTokens = { 1:[], 2:[], 3:[], 4:[], 5:[], 6:[], 7:[] };
+    const dayTokens = {1:[],2:[],3:[],4:[],5:[],6:[],7:[]};
 
     leadsSnap.docs.forEach((d) => {
       const data = d.data();
@@ -460,13 +425,9 @@ app.post("/preview-all-days", async (req, res) => {
     const total = Object.values(dayTokens).flat().length;
     const countryLabel = filterCountry || "Todos";
 
-    res.send(`
-<!DOCTYPE html><html><head><title>Preview Todos los Días</title>
-<style>body{font-family:Arial;background:#f5f7fb;padding:30px}.container{max-width:700px;margin:auto}
-.card{background:#fff;padding:24px;border-radius:14px;box-shadow:0 8px 20px rgba(0,0,0,.08);margin-bottom:16px}
-button{padding:14px 28px;font-size:16px;font-weight:700;border-radius:10px;border:none;cursor:pointer;margin-right:10px}
-.primary{background:#1FA971;color:#fff}.secondary{background:#eee;color:#333}</style></head>
-<body><div class="container">
+    res.send(`<!DOCTYPE html><html><head><title>Preview Todos los Días</title>
+<style>${CSS}</style></head><body>
+<div class="container">
 <h1>🚀 Preview — Todos los días (${countryLabel})</h1>
 <div class="card">
   ${Object.entries(dayTokens).map(([d,t]) =>
@@ -475,11 +436,11 @@ button{padding:14px 28px;font-size:16px;font-weight:700;border-radius:10px;borde
   <p><strong>Total: ${total} envíos</strong></p>
   <form method="POST" action="/send-all-days">
     <input type="hidden" name="country" value="${filterCountry || 'ALL'}"/>
-    <button class="primary" onclick="return confirm('¿Enviar a ${total} usuarios en total?')">
+    <button class="primary" onclick="return confirm('¿Enviar a ${total} usuarios?')">
       ✅ Confirmar envío masivo
     </button>
-    <a href="/"><button type="button" class="secondary">Cancelar</button></a>
   </form>
+  <a href="/"><button type="button" class="secondary" style="margin-top:8px">Cancelar</button></a>
 </div></div></body></html>`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
@@ -494,8 +455,8 @@ app.post("/send-all-days", async (req, res) => {
   try {
     const filterCountry = req.body.country && req.body.country !== "ALL" ? req.body.country : null;
     const leadsSnap = await db.collection("leads").get();
+    const dayTokens = {1:[],2:[],3:[],4:[],5:[],6:[],7:[]};
 
-    const dayTokens = { 1:[], 2:[], 3:[], 4:[], 5:[], 6:[], 7:[] };
     leadsSnap.docs.forEach((d) => {
       const data = d.data();
       if (filterCountry && data.country !== filterCountry) return;
@@ -504,18 +465,17 @@ app.post("/send-all-days", async (req, res) => {
     });
 
     let totalSent = 0;
-    let totalInvalid = [];
-
+    let allInvalid = [];
     for (const [day, tokens] of Object.entries(dayTokens)) {
       if (!tokens.length) continue;
       const payload = { title: DAY_PRESETS[day], body: `Actualización del día ${day} de tu solicitud.` };
       const { sent, invalidTokens } = await sendPush(tokens, payload, "application-status");
       totalSent += sent;
-      totalInvalid = totalInvalid.concat(invalidTokens);
+      allInvalid = allInvalid.concat(invalidTokens);
     }
 
-    const cleaned = await cleanInvalidTokens(totalInvalid);
-    res.redirect(`/?msg=✅ Enviado a ${totalSent} usuarios (todos los días). ${cleaned} tokens inválidos limpiados.`);
+    const cleaned = await cleanInvalidTokens(allInvalid);
+    res.redirect(`/?msg=✅ Enviado a ${totalSent} usuarios. ${cleaned} tokens inválidos limpiados.`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
   }
@@ -527,27 +487,12 @@ app.post("/send-all-days", async (req, res) => {
 
 app.get("/purge-null-tokens", async (req, res) => {
   try {
-    const leadsSnap = await db.collection("leads")
-      .where("pushToken", "==", null).get();
-
+    const snap = await db.collection("leads").get();
     const batch = db.batch();
     let count = 0;
-
-    leadsSnap.docs.forEach((d) => {
-      batch.delete(d.ref);
-      count++;
+    snap.docs.forEach((d) => {
+      if (!d.data().pushToken) { batch.delete(d.ref); count++; }
     });
-
-    // Also catch leads where pushToken field doesn't exist
-    const leadsSnap2 = await db.collection("leads").get();
-    leadsSnap2.docs.forEach((d) => {
-      const data = d.data();
-      if (!data.pushToken && !leadsSnap.docs.find(x => x.id === d.id)) {
-        batch.delete(d.ref);
-        count++;
-      }
-    });
-
     await batch.commit();
     res.redirect(`/?msg=🗑️ ${count} leads sin pushToken eliminados`);
   } catch (e) {
@@ -556,50 +501,40 @@ app.get("/purge-null-tokens", async (req, res) => {
 });
 
 /* =========================
-   PURGE: REGISTROS VIEJOS (+15 DÍAS)
+   PURGE: REGISTROS VIEJOS
 ========================= */
 
 app.get("/purge-old", async (req, res) => {
   try {
-    const cutoff = new Date(Date.now() - LEAD_MAX_DAYS * 86400000);
-    const cutoffTimestamp = admin.firestore.Timestamp.fromDate(cutoff);
-
+    const cutoff = admin.firestore.Timestamp.fromDate(
+      new Date(Date.now() - LEAD_MAX_DAYS * 86400000)
+    );
     const batch = db.batch();
-    let leadsDeleted = 0;
-    let devicesDeleted = 0;
+    let leadsDeleted = 0, devicesDeleted = 0;
 
-    // Leads con createdAt > 15 días
-    const oldLeads = await db.collection("leads")
-      .where("createdAt", "<", cutoffTimestamp).get();
-    oldLeads.docs.forEach((d) => {
-      batch.delete(d.ref);
-      leadsDeleted++;
-    });
+    const oldLeads = await db.collection("leads").where("createdAt", "<", cutoff).get();
+    oldLeads.docs.forEach((d) => { batch.delete(d.ref); leadsDeleted++; });
 
-    // Devices con updated_at > 15 días (inactivos)
-    const oldDevices = await db.collection("devices")
-      .where("updated_at", "<", cutoffTimestamp).get();
-    oldDevices.docs.forEach((d) => {
-      batch.delete(d.ref);
-      devicesDeleted++;
-    });
+    const oldDevices = await db.collection("devices").where("updated_at", "<", cutoff).get();
+    oldDevices.docs.forEach((d) => { batch.delete(d.ref); devicesDeleted++; });
 
     await batch.commit();
-    res.redirect(`/?msg=🗑️ Purga completada: ${leadsDeleted} leads y ${devicesDeleted} devices eliminados (más de ${LEAD_MAX_DAYS} días)`);
+    res.redirect(`/?msg=🗑️ ${leadsDeleted} leads y ${devicesDeleted} devices eliminados (+${LEAD_MAX_DAYS} días)`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
   }
 });
 
 /* =========================
-   CLEAN INVALID TOKENS (validate via Expo)
+   CLEAN INVALID TOKENS
 ========================= */
 
 app.get("/clean-tokens", async (req, res) => {
   try {
-    const devicesSnap = await db.collection("devices").get();
-    const leadsSnap = await db.collection("leads").get();
-
+    const [devicesSnap, leadsSnap] = await Promise.all([
+      db.collection("devices").get(),
+      db.collection("leads").get(),
+    ]);
     const allTokens = new Set();
     devicesSnap.docs.forEach((d) => { if (d.data().expo_push_token) allTokens.add(d.data().expo_push_token); });
     leadsSnap.docs.forEach((d) => { if (d.data().pushToken) allTokens.add(d.data().pushToken); });
@@ -617,14 +552,12 @@ app.get("/clean-tokens", async (req, res) => {
       const json = await resp.json();
       json.data.forEach((result, idx) => {
         const e = result.details?.error;
-        if (e === "DeviceNotRegistered" || e === "InvalidCredentials") {
-          invalidTokens.push(chunk[idx]);
-        }
+        if (e === "DeviceNotRegistered" || e === "InvalidCredentials") invalidTokens.push(chunk[idx]);
       });
     }
 
     const cleaned = await cleanInvalidTokens(invalidTokens);
-    res.redirect(`/?msg=✅ Limpieza completada: ${cleaned} tokens inválidos eliminados de ${tokenArr.length} revisados`);
+    res.redirect(`/?msg=✅ ${cleaned} tokens inválidos eliminados de ${tokenArr.length} revisados`);
   } catch (e) {
     res.redirect(`/?error=${encodeURIComponent(e.message)}`);
   }
@@ -636,78 +569,52 @@ app.get("/clean-tokens", async (req, res) => {
 
 app.get("/diagnostico", async (req, res) => {
   try {
-    const { byCountry, totalDevices, totalLeads, devicesSnap, leadsSnap } = await loadStats();
+    const [devicesSnap, leadsSnap] = await Promise.all([
+      db.collection("devices").get(),
+      db.collection("leads").get(),
+    ]);
 
-    const devicesTokens = new Set();
-    const devicesDuplicates = [];
+    const devTokens = new Set();
+    const devDupes = [];
     devicesSnap.docs.forEach((d) => {
       const token = d.data().expo_push_token;
-      if (token) {
-        if (devicesTokens.has(token)) devicesDuplicates.push({ id: d.id, token });
-        devicesTokens.add(token);
-      }
+      if (!token) return;
+      if (devTokens.has(token)) devDupes.push({ id: d.id, token });
+      devTokens.add(token);
     });
 
-    const leadsTokens = new Set();
-    const leadsDuplicates = [];
-    let leadsWithoutToken = 0;
-    let leadsWithoutCreatedAt = 0;
+    const leadTokens = new Set();
+    const leadDupes = [];
+    let noToken = 0, noCreatedAt = 0;
     leadsSnap.docs.forEach((d) => {
       const data = d.data();
-      if (!data.pushToken) { leadsWithoutToken++; return; }
-      if (leadsTokens.has(data.pushToken)) leadsDuplicates.push({ id: d.id, token: data.pushToken });
-      leadsTokens.add(data.pushToken);
-      if (!data.createdAt) leadsWithoutCreatedAt++;
+      if (!data.pushToken) { noToken++; return; }
+      if (leadTokens.has(data.pushToken)) leadDupes.push({ id: d.id, token: data.pushToken });
+      leadTokens.add(data.pushToken);
+      if (!data.createdAt) noCreatedAt++;
     });
 
-    const countryFlag = { MX: "🇲🇽", ES: "🇪🇸", CO: "🇨🇴", "?": "❓" };
+    res.send(`<!DOCTYPE html><html><head><title>Diagnóstico</title>
+<style>${CSS}</style></head><body>
+<div class="container">
+<h1>🔍 Diagnóstico</h1>
+<a href="/">← Volver</a>
 
-    res.send(`
-<!DOCTYPE html><html><head><title>Diagnóstico</title>
-<style>
-body{font-family:Arial;background:#f5f7fb;padding:30px}
-.container{max-width:1000px;margin:auto}
-.card{background:#fff;padding:20px;border-radius:14px;box-shadow:0 8px 20px rgba(0,0,0,.08);margin-bottom:20px}
-h1{color:#333} h2{color:#1FA971;border-bottom:2px solid #1FA971;padding-bottom:10px}
-.stat{display:grid;grid-template-columns:2fr 1fr;padding:10px;border-bottom:1px solid #eee}
-.stat:last-child{border:none} .label{font-weight:600} .value{text-align:right;color:#1FA971;font-weight:700}
-.warning{color:#F6A800} .danger{color:#dc3545}
-.btn{display:inline-block;padding:12px 20px;background:#dc3545;color:#fff;text-decoration:none;border-radius:8px;font-weight:700;margin:4px}
-.btn.green{background:#1FA971} pre{background:#f8f9fa;padding:15px;border-radius:8px;overflow-x:auto;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
-</style></head><body><div class="container">
-<h1>🔍 Diagnóstico Completo</h1>
-
-<div class="card">
-<h2>📊 Resumen General</h2>
-<div class="stat"><span class="label">Total Devices:</span><span class="value">${totalDevices}</span></div>
-<div class="stat"><span class="label">Total Leads:</span><span class="value">${totalLeads}</span></div>
-<div class="stat"><span class="label">Leads sin pushToken:</span><span class="value warning">${leadsWithoutToken}</span></div>
-<div class="stat"><span class="label">Leads sin createdAt:</span><span class="value warning">${leadsWithoutCreatedAt}</span></div>
-<div class="stat"><span class="label">Duplicados en devices:</span><span class="value danger">${devicesDuplicates.length}</span></div>
-<div class="stat"><span class="label">Duplicados en leads:</span><span class="value danger">${leadsDuplicates.length}</span></div>
-</div>
-
-<div class="card">
-<h2>🌎 Breakdown por País</h2>
-<div class="grid">
-  ${[...COUNTRIES, "?"].map((c) => {
-    const s = byCountry[c];
-    return `<div style="background:#f8f9fa;padding:14px;border-radius:10px">
-      <strong>${countryFlag[c]} ${c}</strong>
-      <p style="margin:6px 0;font-size:13px">📱 ${s.devices} devices</p>
-      <p style="margin:6px 0;font-size:13px">📋 ${s.leads} leads</p>
-      <p style="margin:6px 0;font-size:13px">🚫 ${s.noLead} sin solicitud</p>
-    </div>`;
-  }).join("")}
-</div>
+<div class="card" style="margin-top:20px">
+<h2>📊 Resumen</h2>
+<div class="stat-row"><span class="slabel">Total Devices:</span><span class="svalue">${devicesSnap.size}</span></div>
+<div class="stat-row"><span class="slabel">Total Leads:</span><span class="svalue">${leadsSnap.size}</span></div>
+<div class="stat-row"><span class="slabel">Leads sin pushToken:</span><span class="svalue warning">${noToken}</span></div>
+<div class="stat-row"><span class="slabel">Leads sin createdAt:</span><span class="svalue warning">${noCreatedAt}</span></div>
+<div class="stat-row"><span class="slabel">Duplicados en devices:</span><span class="svalue danger-text">${devDupes.length}</span></div>
+<div class="stat-row"><span class="slabel">Duplicados en leads:</span><span class="svalue danger-text">${leadDupes.length}</span></div>
 </div>
 
 <div class="card">
 <h2>🧹 Acciones</h2>
 <a href="/fix-duplicates" class="btn" onclick="return confirm('¿Eliminar duplicados?')">🔧 Arreglar duplicados</a>
-<a href="/purge-null-tokens" class="btn" onclick="return confirm('¿Purgar leads sin token?')">🗑️ Purgar sin token</a>
-<a href="/purge-old" class="btn" onclick="return confirm('¿Purgar registros viejos?')">🗑️ Purgar +${LEAD_MAX_DAYS} días</a>
+<a href="/purge-null-tokens" class="btn" onclick="return confirm('¿Purgar sin token?')">🗑️ Purgar sin token</a>
+<a href="/purge-old" class="btn" onclick="return confirm('¿Purgar viejos?')">🗑️ Purgar +${LEAD_MAX_DAYS} días</a>
 </div>
 
 <a href="/">← Volver</a>
@@ -727,7 +634,6 @@ app.get("/fix-duplicates", async (req, res) => {
       db.collection("devices").get(),
       db.collection("leads").get(),
     ]);
-
     const batch = db.batch();
     let fixed = 0;
 
@@ -739,9 +645,7 @@ app.get("/fix-duplicates", async (req, res) => {
       devMap.get(token).push(d);
     });
     devMap.forEach((docs) => {
-      if (docs.length > 1) {
-        for (let i = 1; i < docs.length; i++) { batch.delete(docs[i].ref); fixed++; }
-      }
+      for (let i = 1; i < docs.length; i++) { batch.delete(docs[i].ref); fixed++; }
     });
 
     const leadMap = new Map();
