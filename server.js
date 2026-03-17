@@ -674,6 +674,122 @@ app.get("/fix-duplicates", async (req, res) => {
 });
 
 /* =========================
+   CRON — AUTO PUSH
+   Render server timezone = UTC
+   
+   MX (UTC-6): 9am = 15:00 UTC, 7pm = 01:00 UTC
+   CO (UTC-5): 9am = 14:00 UTC, 7pm = 00:00 UTC  
+   ES (UTC+1/+2): 9am = 08:00 UTC, 8pm = 19:00 UTC
+========================= */
+
+const cron = require("node-cron");
+
+/* Helper: send to all devices with hasLead !== true for a country */
+async function autoSendNoLead(country, preset) {
+  try {
+    const snap = await db.collection("devices").get();
+    const tokens = [];
+    snap.docs.forEach((d) => {
+      const data = d.data();
+      if (data.hasLead === true) return;
+      if (data.country !== country) return;
+      if (data.expo_push_token) tokens.push(data.expo_push_token);
+    });
+    if (!tokens.length) return;
+    const payload = NO_LEAD_PRESETS[preset];
+    const { sent, invalidTokens } = await sendPush(tokens, payload, "home");
+    await cleanInvalidTokens(invalidTokens);
+    console.log(`[CRON] NoLead ${country} ${preset}: ${sent} enviados`);
+  } catch (e) {
+    console.error(`[CRON] Error noLead ${country}:`, e.message);
+  }
+}
+
+/* Helper: send day updates to leads for a country */
+async function autoSendDays(country) {
+  try {
+    const leadsSnap = await db.collection("leads").get();
+    const dayTokens = {1:[],2:[],3:[],4:[],5:[],6:[],7:[]};
+    leadsSnap.docs.forEach((d) => {
+      const data = d.data();
+      if (data.country !== country) return;
+      const day = calcDayFromCreatedAt(data.createdAt);
+      if (day && data.pushToken) dayTokens[day].push(data.pushToken);
+    });
+
+    let totalSent = 0;
+    let allInvalid = [];
+    for (const [day, tokens] of Object.entries(dayTokens)) {
+      if (!tokens.length) continue;
+      const payload = {
+        title: DAY_PRESETS[day],
+        body: `Actualización del día ${day} de tu solicitud.`,
+      };
+      const { sent, invalidTokens } = await sendPush(tokens, payload, "application-status");
+      totalSent += sent;
+      allInvalid = allInvalid.concat(invalidTokens);
+    }
+    await cleanInvalidTokens(allInvalid);
+    console.log(`[CRON] Days ${country}: ${totalSent} enviados`);
+  } catch (e) {
+    console.error(`[CRON] Error days ${country}:`, e.message);
+  }
+}
+
+// Rotate through presets so no-lead users get different messages
+const NO_LEAD_PRESET_KEYS = Object.keys(NO_LEAD_PRESETS);
+let presetIndex = 0;
+function nextPreset() {
+  const key = NO_LEAD_PRESET_KEYS[presetIndex % NO_LEAD_PRESET_KEYS.length];
+  presetIndex++;
+  return key;
+}
+
+/* ── MX — 9am México (15:00 UTC) ── */
+cron.schedule("0 15 * * *", async () => {
+  console.log("[CRON] MX morning");
+  await autoSendNoLead("MX", nextPreset());
+  await autoSendDays("MX");
+});
+
+/* ── MX — 7pm México (01:00 UTC next day) ── */
+cron.schedule("0 1 * * *", async () => {
+  console.log("[CRON] MX evening");
+  await autoSendNoLead("MX", nextPreset());
+  await autoSendDays("MX");
+});
+
+/* ── CO — 9am Colombia (14:00 UTC) ── */
+cron.schedule("0 14 * * *", async () => {
+  console.log("[CRON] CO morning");
+  await autoSendNoLead("CO", nextPreset());
+  await autoSendDays("CO");
+});
+
+/* ── CO — 7pm Colombia (00:00 UTC) ── */
+cron.schedule("0 0 * * *", async () => {
+  console.log("[CRON] CO evening");
+  await autoSendNoLead("CO", nextPreset());
+  await autoSendDays("CO");
+});
+
+/* ── ES — 9am España (08:00 UTC) ── */
+cron.schedule("0 8 * * *", async () => {
+  console.log("[CRON] ES morning");
+  await autoSendNoLead("ES", nextPreset());
+  await autoSendDays("ES");
+});
+
+/* ── ES — 8pm España (19:00 UTC) ── */
+cron.schedule("0 19 * * *", async () => {
+  console.log("[CRON] ES evening");
+  await autoSendNoLead("ES", nextPreset());
+  await autoSendDays("ES");
+});
+
+console.log("⏰ Cron jobs activos: MX(15,01 UTC) CO(14,00 UTC) ES(08,19 UTC)");
+
+/* =========================
    START
 ========================= */
 
